@@ -1,7 +1,7 @@
-# Solar-wind speed forecasting: from competition entry to MLOps showcase
+# Solar-wind speed forecasting
 
 Live forecasts of ACE/SWEPAM bulk solar-wind speed, t0+1…72 h, every 6 h (FDL Benchlab tournament 2026).
-The repo covers the whole path: data cut-offs enforced in code, a small blend model, honest evaluation, a container, a scheduled pipeline and a website.
+The repo covers the whole path: data cut-offs enforced in code, a small blend model, evaluation, a container, a scheduled pipeline and a website.
 
 **Status:** Phase 0 (foundation). See `docs/ROADMAP.md`.
 
@@ -24,7 +24,7 @@ flowchart LR
 | `scripts/` | `replay_eval.py` (replay past cycles through the image and score them), exporters |
 | `submission/` | the container as sent to the competition. Treat as frozen: change `src/`, not this |
 | `research/` | the experiment code from the competition (features, ladder, bench scorer, Timestral, TCN). Not packaged |
-| `docs/` | architecture, roadmap, experiment protocol |
+| `docs/` | architecture, roadmap |
 
 ## Quick start
 ```bash
