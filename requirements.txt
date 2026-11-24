@@ -1,0 +1,7 @@
+# pinned runtime for the Docker image (Python 3.10 on ubuntu:22.04); same pins as the submitted container
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+scikit-image==0.24.0
+astropy==6.0.1
+requests==2.32.3

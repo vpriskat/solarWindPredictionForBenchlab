@@ -1,0 +1,8 @@
+.git
+.venv
+data
+research
+submission
+tests
+replay_out
+**/__pycache__

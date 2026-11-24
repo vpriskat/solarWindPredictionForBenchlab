@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swp"
+version = "0.1.0"
+description = "Live ACE solar-wind speed forecasting (t0+1..72 h): data cut-offs, blend model, evaluation, pipeline"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "pandas>=2.2"]
+
+[project.optional-dependencies]
+image = ["scipy>=1.13", "scikit-image>=0.24", "astropy>=6.0", "requests>=2.32"]   # AIA coronal-hole step
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+swp = ["artifacts/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+extend-exclude = ["research", "submission"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E401", "E402", "F401", "E701", "E702", "E731", "E741", "E501"]   # model.py / segment_ch.py are written in a compact style
