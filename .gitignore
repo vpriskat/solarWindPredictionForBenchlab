@@ -14,3 +14,7 @@ out/
 *.pkl
 *.parquet
 mlruns/
+store_run_data/
+err.log
+out.json
+temp_out

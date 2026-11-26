@@ -13,7 +13,6 @@ import urllib.request
 
 import numpy as np
 import pandas as pd
-
 HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")   # blend / strip model files
 H = 72
 LAG_H = 3                  # ACE hourly labels admitted: <= t0 - LAG_H
@@ -66,6 +65,40 @@ def parse_monthly(text):
 
 
 def fetch_ace(t0, days=36):
+    """Valid (status 0) hourly ACE speed with label <= t0 - LAG_H, as an hourly Series (NaN where missing).
+    Raises RuntimeError if nothing could be fetched because every source failed; returns (None, src) if the
+    sources answered but no usable data is left."""
+    cut = t0 - pd.Timedelta(hours=LAG_H)
+    rows, src, errors = {}, [], []
+    for ym in pd.period_range(t0 - pd.Timedelta(days=days), t0, freq="M").strftime("%Y%m"):
+        try:
+            rows.update(parse_monthly(http_get(ACE_MONTHLY.format(ym=ym), 40).decode("ascii", "replace")))
+            src.append(f"monthly:{ym}")
+        except Exception as e:
+            log("ACE monthly", ym, "failed:", repr(e)[:80])
+            errors.append(f"monthly:{ym}: {e!r}"[:100])
+    if not rows or max(rows) < cut - pd.Timedelta(days=3):          # monthly files missing/stale -> SWPC json (dsflag 0)
+        try:
+            for r in json.loads(http_get(ACE_JSON, 40)):
+                if r.get("dsflag") == 0 and r.get("speed") is not None and 0 < r["speed"] < 3000:
+                    rows[pd.Timestamp(r["time_tag"]).tz_localize(None) if pd.Timestamp(r["time_tag"]).tzinfo else pd.Timestamp(r["time_tag"])] = float(r["speed"])
+            src.append("json")
+        except Exception as e:
+            log("ACE json failed:", repr(e)[:80])
+            errors.append(f"json: {e!r}"[:100])
+    if not rows:
+        if errors:                                   # nothing fetched and something went wrong: a failure, not "empty"
+            raise RuntimeError("ACE unavailable: " + "; ".join(errors)[:300])
+        return None, src
+    s = pd.Series(rows).sort_index()
+    s = s[s.index <= cut]
+    s = s[~s.index.duplicated(keep="last")]
+    s = s[s.index == s.index.floor("h")]
+    if s.empty:
+        return None, src
+    return s.reindex(pd.date_range(s.index.min().floor("D"), cut, freq="h")), src
+
+def fetch_ace2(t0, days=36):
     """Valid (status 0) hourly ACE speed with label <= t0 - LAG_H, as an hourly Series (NaN where missing)."""
     cut = t0 - pd.Timedelta(hours=LAG_H)
     rows, src = {}, []
@@ -110,7 +143,8 @@ def fetch_enlil():
     run = t.min().round("h")
     grid = pd.date_range(run, t.max().floor("h"), freq="h")
     ep = pd.Timestamp("1970-01-01")
-    x = np.interp(((grid - ep) / pd.Timedelta(seconds=1)).to_numpy(float), ((t - ep) / pd.Timedelta(seconds=1)).to_numpy(float), v)
+    x = np.interp(((grid - ep) / pd.Timedelta(seconds=1)).to_numpy(float),
+                  ((t - ep) / pd.Timedelta(seconds=1)).to_numpy(float), v)
     return run, pd.Series(x, index=grid)
 
 
@@ -219,18 +253,36 @@ def strip_from_images(t0, strips, meta, z):
     return np.clip(raw, z["adj_min"], z["adj_max"])
 
 
+def finalize(t0, obs, src, enlil, adj, info = None):
+    info = dict(info or {}, level="full", ace_sources=src)
+    if obs is not None:
+        info["ace_last_label"] = str(obs.dropna().index.max())
+        info["ace_cut"] = str(t0 - pd.Timedelta(hours=LAG_H))
+    blend = json.load(open(os.path.join(HERE, "final_blend.json")))
+    pred, meta = core(t0, obs, enlil, adj, blend)
+    info.update(meta)
+    if obs is None or not np.isfinite(meta["persistence"]):
+        info["level"] = "no_ace"
+        base = enlil_for(t0, enlil)[0]
+        pred = np.where(np.isfinite(base), base, CLIM)
+    elif adj is None:
+        info["level"] = "no_strip"
+    if not np.all(np.isfinite(pred)):
+        info["level"] = "persistence"
+        p = meta["persistence"]
+        pred = np.full(H, p if np.isfinite(p) else CLIM)
+    pred = np.clip(pred, 180.0, 1200.0)
+    return pred, info
+
+
 # ------------------------------------------------------------------------------------------------ orchestration
 def predict(t0):
-    blend = json.load(open(os.path.join(HERE, "final_blend.json")))
-    info = dict(level="full")
+    info = {}
     obs, src = None, []
     try:
         obs, src = fetch_ace(t0)
     except Exception as e:
         log("ACE failed:", repr(e)[:100]); info["ace_error"] = repr(e)[:100]
-    info["ace_sources"] = src
-    if obs is not None:
-        info["ace_last_label"] = str(obs.dropna().index.max()); info["ace_cut"] = str(t0 - pd.Timedelta(hours=LAG_H))
     enlil = None
     try:
         enlil = fetch_enlil()
@@ -242,19 +294,7 @@ def predict(t0):
             adj = strip_adjustment(t0)
         except Exception as e:
             log("strip failed:", repr(e)[:120]); info["strip_error"] = repr(e)[:120]
-    pred, meta = core(t0, obs, enlil, adj, blend)
-    info.update(meta)
-    if obs is None or not np.isfinite(meta["persistence"]):
-        info["level"] = "no_ace"
-        base = enlil_for(t0, enlil)[0]
-        pred = np.where(np.isfinite(base), base, CLIM)
-    elif adj is None:
-        info["level"] = "no_strip"
-    if not np.all(np.isfinite(pred)):
-        info["level"] = "persistence"
-        p = meta["persistence"]; pred = np.full(H, p if np.isfinite(p) else CLIM)
-    pred = np.clip(pred, 180.0, 1200.0)
-    return pred, info
+    return finalize(t0, obs, src, enlil, adj, info)
 
 
 def main():

@@ -9,6 +9,7 @@ import pytest
 from swp import model
 
 T0 = pd.Timestamp("2026-11-10 06:00")
+HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")
 BLEND = json.load(open(os.path.join(model.HERE, "final_blend.json")))
 
 
@@ -61,11 +62,39 @@ def test_core_outputs_72_finite_values():
     assert info["n_enlil"] == 0 and not info["strip_used"]
 
 
+def test_ace_raises_when_every_source_fails(monkeypatch):
+    def boom(url, timeout=30, retries=2):
+        raise OSError("no network")
+    monkeypatch.setattr(model, "http_get", boom)
+    with pytest.raises(RuntimeError, match="no network"):
+        model.fetch_ace(T0)
+
+
+def test_ace_survives_one_failed_month(monkeypatch):
+    good = fake_http(pd.Timestamp("2026-10-01"), 24 * 45)
+
+    def flaky(url, timeout=30, retries=2):
+        if "202610" in url:
+            raise OSError("boom")
+        return good(url)
+    monkeypatch.setattr(model, "http_get", flaky)
+    obs, src = model.fetch_ace(T0)
+    assert obs is not None and "monthly:202611" in src and "monthly:202610" not in src
+
 @pytest.mark.parametrize("obs", [None, pd.Series(dtype=float)])
 def test_core_without_obs_does_not_crash(obs):
     pred, info = model.core(T0, obs, None, None, BLEND)
     assert pred.shape == (72,) and np.isfinite(pred).all()
 
+def test_finalize_fallback_levels():
+    idx = pd.date_range(T0 - pd.Timedelta(days=36), T0 - pd.Timedelta(hours=3), freq="h")
+    obs = pd.Series(450.0, index=idx)
+    _, info = model.finalize(T0, obs, ["x"], None, np.zeros(72))
+    assert info["level"] == "full"
+    _, info = model.finalize(T0, obs, ["x"], None, None)
+    assert info["level"] == "no_strip"
+    pred, info = model.finalize(T0, None, [], None, None)
+    assert info["level"] == "no_ace" and np.allclose(pred, model.CLIM)
 
 def test_strip_adjustment_is_additive_and_scaled():
     idx = pd.date_range(T0 - pd.Timedelta(days=36), T0 - pd.Timedelta(hours=3), freq="h")
