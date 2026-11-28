@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from swp.storage import CycleRepository
 from swp.storage.factory import create_byte_store
-
+from swp import diagnostics
 T_START = time.time()
 
 
@@ -41,14 +41,10 @@ def resolve_future(fut, data_source: str, info: dict, logger, default=None):
         return default
     else:
         result = fut.result()
-        is_empty = result is None or (
-                data_source == "ace" and isinstance(result, tuple) and result[0] is None
-        )
-        if is_empty:
-            info[f"{data_source}_status"] = "empty"
-            return default
-        info[f"{data_source}_status"] = "success"
-        return result
+        is_empty = result is None or (isinstance(result, tuple) and result[0] is None)
+        info[f"{data_source}_status"] = "empty" if is_empty else "success"
+        return default if result is None else result
+
 
 
 
@@ -70,8 +66,9 @@ def live_cycle(t0):
     result_enlil = resolve_future(enlil_fut, data_source="enlil", info=info, logger=logger, default=None)
     enlil = result_enlil
 
-    result_strip = resolve_future(strip_fut, data_source="strip", info=info, logger=logger, default=None)
-    adj = result_strip
+    result_strip = resolve_future(strip_fut, data_source="strip", info=info, logger=logger, default=(None, {}))
+    adj, strip_info = result_strip
+    info.update(strip_info)
 
     return model.finalize(t0, obs, src, enlil, adj, info)
 
@@ -82,21 +79,21 @@ def latest_cycle_t0(now=None):
     return now.replace(hour=now.hour // 6 * 6, minute=0, second=0, microsecond=0, tzinfo=None)
 
 
-if __name__ == "__main__":
-    if len(sys.argv) > 2:
+def main(argv):
+    if len(argv) > 1:
         print("usage: live_cycle.py [YYYYMMDDTHHMMSSZ]  (default: latest 6h cycle)", file=sys.stderr)
-        sys.exit(1)
-
-    if len(sys.argv) == 2:
-        t0 = pd.Timestamp(datetime.strptime(sys.argv[1], "%Y%m%dT%H%M%SZ"))
+        return 1
+    if len(argv) == 1:
+        t0 = pd.Timestamp(datetime.strptime(argv[0], "%Y%m%dT%H%M%SZ"))
     else:
         t0 = pd.Timestamp(latest_cycle_t0())
     t0String = t0.strftime("%Y%m%dT%H%M%SZ")
 
     pred, info = live_cycle(t0)
 
+    info.update(diagnostics.provenance(model.HERE))
     info["retrieved_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    log("info:", info)
+    log("info:", {k: v for k, v in info.items() if k != "components"})
     log("forecast_kms:", json.dumps([round(float(v), 1) for v in pred]))
     json.dump({"t0": t0.strftime("%Y-%m-%dT%H:%M:%SZ"), "valid_from": (t0 + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                "forecast_speed_kms": [float(v) for v in pred]}, sys.stdout)
@@ -104,3 +101,4 @@ if __name__ == "__main__":
     store = CycleRepository(create_byte_store())
     store.save_forecast(t0String, pred)
     store.save_run_record(t0String, info)
+    return 0

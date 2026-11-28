@@ -10,7 +10,7 @@ import json, os, sys, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import urllib.request
-
+from swp import diagnostics
 import numpy as np
 import pandas as pd
 HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")   # blend / strip model files
@@ -63,7 +63,6 @@ def parse_monthly(text):
             continue
     return rows
 
-
 def fetch_ace(t0, days=36):
     """Valid (status 0) hourly ACE speed with label <= t0 - LAG_H, as an hourly Series (NaN where missing).
     Raises RuntimeError if nothing could be fetched because every source failed; returns (None, src) if the
@@ -98,16 +97,17 @@ def fetch_ace(t0, days=36):
         return None, src
     return s.reindex(pd.date_range(s.index.min().floor("D"), cut, freq="h")), src
 
-def fetch_ace2(t0, days=36):
-    """Valid (status 0) hourly ACE speed with label <= t0 - LAG_H, as an hourly Series (NaN where missing)."""
-    cut = t0 - pd.Timedelta(hours=LAG_H)
-    rows, src = {}, []
-    for ym in pd.period_range(t0 - pd.Timedelta(days=days), t0, freq="M").strftime("%Y%m"):
+def load_ace_rows(t_ref, days=36):
+    """All valid ACE speeds (status 0), without the competition lag cut: (dict timestamp -> km/s, sources, errors)."""
+    cut = t_ref - pd.Timedelta(hours=LAG_H)
+    rows, src, errors = {}, [], []
+    for ym in pd.period_range(t_ref - pd.Timedelta(days=days), t_ref, freq="M").strftime("%Y%m"):
         try:
             rows.update(parse_monthly(http_get(ACE_MONTHLY.format(ym=ym), 40).decode("ascii", "replace")))
             src.append(f"monthly:{ym}")
         except Exception as e:
             log("ACE monthly", ym, "failed:", repr(e)[:80])
+            errors.append(f"monthly:{ym}: {e!r}"[:100])
     if not rows or max(rows) < cut - pd.Timedelta(days=3):          # monthly files missing/stale -> SWPC json (dsflag 0)
         try:
             for r in json.loads(http_get(ACE_JSON, 40)):
@@ -116,15 +116,8 @@ def fetch_ace2(t0, days=36):
             src.append("json")
         except Exception as e:
             log("ACE json failed:", repr(e)[:80])
-    if not rows:
-        return None, src
-    s = pd.Series(rows).sort_index()
-    s = s[s.index <= cut]
-    s = s[~s.index.duplicated(keep="last")]
-    s = s[s.index == s.index.floor("h")]
-    if s.empty:
-        return None, src
-    return s.reindex(pd.date_range(s.index.min().floor("D"), cut, freq="h")), src
+            errors.append(f"json: {e!r}"[:100])
+    return rows, src, errors
 
 
 # ------------------------------------------------------------------------------------------------ ENLIL (latest run)
@@ -147,7 +140,8 @@ def fetch_enlil():
                   ((t - ep) / pd.Timedelta(seconds=1)).to_numpy(float), v)
     return run, pd.Series(x, index=grid)
 
-
+def _clean(v):
+    return [None if not np.isfinite(x) else round(float(x), 1) for x in v]
 # ------------------------------------------------------------------------------------------------ core (pure function)
 def enlil_for(t0, enlil):
     """72 values (NaN where unavailable): latest run, admitted only if started <= t0-12h and age <= 72h, lead <= 72h."""
@@ -187,15 +181,16 @@ def core(t0, obs, enlil, strip_adj, blend, lam=STRIP_LAMBDA):
         p = blend["params"][str(g)]
         pred[i] = p["const"] + X[i] @ np.array(p["beta"])
     adj = np.zeros(H) if strip_adj is None else np.nan_to_num(np.asarray(strip_adj, float))
-    return pred + lam * adj, dict(persistence=pers, enlil_run=None if run is None else str(run), n_enlil=int(np.isfinite(enl).sum()),
-                                  n_rec=int(np.isfinite(rec).sum()), strip_used=strip_adj is not None)
-
-
+    comps = dict(rec27=rec, enlil=enl, blend=pred, adj=lam * adj)
+    return pred + lam * adj, dict(persistence=pers, enlil_run=None if run is None else str(run),
+                                  n_enlil=int(np.isfinite(enl).sum()), n_rec=int(np.isfinite(rec).sum()),
+                                  strip_used=strip_adj is not None, _components=comps)
 # ------------------------------------------------------------------------------------------------ coronal-hole (AIA NRT) adjustment
 def strip_adjustment(t0, deadline_s=240):
-    """72-array from NRT AIA 193 images (daily 00:00 UTC slots) or None.  Any problem -> None (no adjustment)."""
+    """(72-array or None, info dict) from NRT AIA 193 images (daily 00:00 UTC slots).  Any problem -> (None, info)."""
     from swp import segment_ch as S
     import requests
+    started = time.time()
     meta = json.load(open(os.path.join(HERE, "strip_model_meta.json")))
     z = np.load(os.path.join(HERE, "strip_model.npz"))
     delay, tol = meta["delay_h"], meta["tol_h"]
@@ -204,19 +199,27 @@ def strip_adjustment(t0, deadline_s=240):
     days = [d for d in pd.date_range(lo.normalize(), hi.normalize(), freq="D") if d + pd.Timedelta(minutes=25) <= pd.Timestamp(datetime.now(timezone.utc)).tz_localize(None)]
     S.SOURCE = "nrt"
     t_end = time.time() + deadline_s
+    fails = []
     from astropy.io import fits
 
     def one(day):
+        tag = f"{day:%Y-%m-%d}"
         try:
             base = S.NRT_DIR.format(y=f"{day:%Y}", m=f"{day:%m}", d=f"{day:%d}", hh="00")
             r = requests.get(base, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
             if r.status_code != 200:
+                fails.append(f"{tag}:index_http_{r.status_code}")
                 return None
             name = S.nrt_pick(r.text, day, "0000")
-            if name is None or time.time() > t_end:
+            if name is None:
+                fails.append(f"{tag}:no_file")
+                return None
+            if time.time() > t_end:
+                fails.append(f"{tag}:deadline")
                 return None
             r = requests.get(base + name, headers={"User-Agent": "Mozilla/5.0"}, timeout=90)
             if r.status_code != 200 or b"SIMPLE" not in r.content[:100]:
+                fails.append(f"{tag}:fits_http_{r.status_code}")
                 return None
             from io import BytesIO
             with fits.open(BytesIO(r.content)) as hd:
@@ -225,32 +228,44 @@ def strip_adjustment(t0, deadline_s=240):
             row["slot"] = day
             return row
         except Exception as e:
-            log("AIA", f"{day:%Y-%m-%d}", repr(e)[:90])
+            log("AIA", tag, repr(e)[:90])
+            fails.append(f"{tag}:{e!r}"[:70])
             return None
 
     with ThreadPoolExecutor(max_workers=5) as ex:
         rows = [r for r in ex.map(one, days) if r is not None]
     log(f"AIA images: {len(rows)}/{len(days)}")
+    sinfo = {"strip_n_days": len(days), "strip_n_images": len(rows), "strip_fail_reasons": sorted(fails)[:6],
+             "strip_fetch_s": round(time.time() - started, 1)}
     if not rows:
-        return None
+        return None, sinfo
     strips = pd.DataFrame(rows).dropna(subset=["t_obs"]).set_index("t_obs").sort_index()[meta["strip_cols"]]
-    return strip_from_images(t0, strips, meta, z)
+    newest = strips.index.max()
+    sinfo["strip_newest_obs"] = newest.strftime("%Y-%m-%dT%H:%M:%SZ")
+    sinfo["strip_newest_age_h"] = round((t0 - newest) / pd.Timedelta(hours=1), 2)
+    adj, used = strip_from_images(t0, strips, meta, z)
+    sinfo["strip_image_times"] = used
+    sinfo["strip_lags_matched"] = sum(u is not None for u in used)
+    return adj, sinfo
 
 
 def strip_from_images(t0, strips, meta, z):
+    """(72-array or None, [matched image time or None for lags 0/24/48/72])."""
     s = strips.rename_axis("ti").reset_index()
-    parts = []
+    parts, used = [], []
     for lag in (0, 24, 48, 72):
         q = pd.DataFrame({"t0": [t0 - pd.Timedelta(hours=lag + meta["delay_h"])], "k": [0]})
         j = pd.merge_asof(q, s, left_on="t0", right_on="ti", direction="backward", tolerance=pd.Timedelta(hours=meta["tol_h"]))
+        ti = j["ti"].iloc[0]
+        used.append(None if pd.isna(ti) else ti.strftime("%Y-%m-%dT%H:%M:%SZ"))
         parts.append(j.drop(columns=["t0", "ti", "k"]).reset_index(drop=True).add_suffix(f"_L{lag}"))
     Xi = pd.concat(parts, axis=1)
     assert list(Xi.columns) == meta["columns"], "image feature columns differ from the fitted model"
     if not Xi.notna().any(axis=1).iloc[0]:
-        return None
+        return None, used
     Z = (Xi.fillna(0.0).to_numpy() - z["mean"]) / z["scale"]
     raw = (Z @ z["coef"].T + z["intercept"])[0]
-    return np.clip(raw, z["adj_min"], z["adj_max"])
+    return np.clip(raw, z["adj_min"], z["adj_max"]), used
 
 
 def finalize(t0, obs, src, enlil, adj, info = None):
@@ -260,6 +275,7 @@ def finalize(t0, obs, src, enlil, adj, info = None):
         info["ace_cut"] = str(t0 - pd.Timedelta(hours=LAG_H))
     blend = json.load(open(os.path.join(HERE, "final_blend.json")))
     pred, meta = core(t0, obs, enlil, adj, blend)
+    comps = meta.pop("_components")
     info.update(meta)
     if obs is None or not np.isfinite(meta["persistence"]):
         info["level"] = "no_ace"
@@ -271,8 +287,10 @@ def finalize(t0, obs, src, enlil, adj, info = None):
         info["level"] = "persistence"
         p = meta["persistence"]
         pred = np.full(H, p if np.isfinite(p) else CLIM)
-    pred = np.clip(pred, 180.0, 1200.0)
-    return pred, info
+    final = np.clip(pred, 180.0, 1200.0)
+    info.update(diagnostics.describe_cycle(t0, obs, enlil, adj, final))
+    info["components"] = {k: _clean(v) for k, v in {**comps, "final": final}.items()}
+    return final, info
 
 
 # ------------------------------------------------------------------------------------------------ orchestration
@@ -291,7 +309,7 @@ def predict(t0):
     adj = None
     if os.environ.get("SWP_NO_STRIP") != "1":
         try:
-            adj = strip_adjustment(t0)
+            dj, sinfo = strip_adjustment(t0)
         except Exception as e:
             log("strip failed:", repr(e)[:120]); info["strip_error"] = repr(e)[:120]
     return finalize(t0, obs, src, enlil, adj, info)

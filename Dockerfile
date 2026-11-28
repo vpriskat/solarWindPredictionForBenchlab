@@ -29,4 +29,4 @@ COPY flow ./flow
 RUN useradd --create-home --uid 1000 runner && chown -R runner /app
 USER runner
 
-ENTRYPOINT ["python3", "flow/live_cycle.py"]
+ENTRYPOINT ["python3", "flow/cli.py"]
