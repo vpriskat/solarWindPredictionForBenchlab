@@ -76,15 +76,21 @@ def live_cycle(t0):
     return model.finalize(t0, obs, src, enlil, adj, info)
 
 
+def latest_cycle_t0(now=None):
+    """Most recent 6-hour cycle boundary (00/06/12/18 UTC), as a naive timestamp."""
+    now = now or datetime.now(timezone.utc)
+    return now.replace(hour=now.hour // 6 * 6, minute=0, second=0, microsecond=0, tzinfo=None)
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("usage: model.py <YYYYMMDDTHHMMSSZ>", file=sys.stderr)
+    if len(sys.argv) > 2:
+        print("usage: live_cycle.py [YYYYMMDDTHHMMSSZ]  (default: latest 6h cycle)", file=sys.stderr)
         sys.exit(1)
 
-    t0String = sys.argv[1]
-    t0 = pd.Timestamp(datetime.strptime(t0String, "%Y%m%dT%H%M%SZ"))
-    pred, info  = live_cycle(t0)
+    if len(sys.argv) == 2:
+        t0 = pd.Timestamp(datetime.strptime(sys.argv[1], "%Y%m%dT%H%M%SZ"))
+    else:
+        t0 = pd.Timestamp(latest_cycle_t0())
+    t0String = t0.strftime("%Y%m%dT%H%M%SZ")
 
     info["retrieved_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     log("info:", info)
