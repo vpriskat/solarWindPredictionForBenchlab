@@ -81,6 +81,7 @@ def latest_cycle_t0(now=None):
     now = now or datetime.now(timezone.utc)
     return now.replace(hour=now.hour // 6 * 6, minute=0, second=0, microsecond=0, tzinfo=None)
 
+
 if __name__ == "__main__":
     if len(sys.argv) > 2:
         print("usage: live_cycle.py [YYYYMMDDTHHMMSSZ]  (default: latest 6h cycle)", file=sys.stderr)
@@ -92,12 +93,14 @@ if __name__ == "__main__":
         t0 = pd.Timestamp(latest_cycle_t0())
     t0String = t0.strftime("%Y%m%dT%H%M%SZ")
 
+    pred, info = live_cycle(t0)
+
     info["retrieved_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     log("info:", info)
     log("forecast_kms:", json.dumps([round(float(v), 1) for v in pred]))
     json.dump({"t0": t0.strftime("%Y-%m-%dT%H:%M:%SZ"), "valid_from": (t0 + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                "forecast_speed_kms": [float(v) for v in pred]}, sys.stdout)
 
-    store = CycleRepository( create_byte_store() )
+    store = CycleRepository(create_byte_store())
     store.save_forecast(t0String, pred)
     store.save_run_record(t0String, info)
